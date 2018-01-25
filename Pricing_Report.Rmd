@@ -1,0 +1,678 @@
+---
+title: "Costs & Pricing Report"
+#author: "Justin Nipko"
+#date: "Jan. 8, 2018"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: cerulean
+  html_notebook:
+    toc: yes
+    toc_float: yes
+---
+
+```{r Load libraries & pull data from SQL, include=F}
+library(tidyverse)
+library(RODBC)
+library(lubridate)
+library(plyr)
+library(knitr)
+library(xlsx)
+library(kableExtra)
+
+cn <- odbcDriverConnect(connection = 
+                          "Driver={SQL Server Native Client 11.0};
+                        server={Justin\\SQLEXPRESS};
+                        database={Stone Meats};
+                        trusted_connection=yes;")
+
+PurchasePrices <- sqlFetch(cn, 'Query',
+                      colnames = F,
+                      rows_at_time = 1000)
+
+USDAPrices <- sqlFetch(cn, 'WeeklyMeatPrices',
+                       colnames = F,
+                       rows_at_time = 1000)
+
+BlendIngredients <- sqlFetch(cn, 'BlendIngredients',
+                             colnames = F,
+                             rows_at_time = 1000)
+
+Margins <- sqlFetch(cn, 'Margins$',
+                    colnames = F,
+                    rows_at_time = 1000)
+
+old_data <- sqlFetch(cn, 'FinalProductCosts',
+                      colnames = F,
+                      rows_at_time = 1000)
+
+USDAequiv <- sqlFetch(cn, 'Products_USDA_Blend$',
+                      colnames = F,
+                      rows_at_time = 1000)
+
+odbcCloseAll()
+
+current_date <- format(Sys.Date(), format = '%m/%d/%Y')
+```
+*Week of `r current_date`*
+
+## **Costs**
+```{r Pull most recent USDA Prices, include=F}
+CurrentUSDAPrices <- subset(USDAPrices,
+                            Date == max(USDAPrices$Date) & Price > 0)
+
+CurrentUSDAPrices <- mutate(CurrentUSDAPrices, 
+                            Price = Price/100)
+
+USDAPricesTable <- CurrentUSDAPrices[,2:3]
+```
+
+```{r Get most recent prices for each product, include=F}
+# Get unique products and most recent prices for each
+product_list <- unique(PurchasePrices$Product)
+
+all_products <- data.frame(Date=as.Date(character()),
+                          Vendor=factor(), 
+                          Product=factor(),
+                          Price = double(),
+                          Quantity = double(),
+                          Qty_Units = factor(),
+                          stringsAsFactors=FALSE) 
+
+i <- 1
+for (Product in product_list) {
+  Product <- subset(PurchasePrices,
+                    Product == product_list[i])
+  
+  Product <- subset(Product, 
+                    Date == max(Date))
+  
+  all_products <- rbind(all_products,
+                        Product)
+  
+  i <- i+1
+}
+
+all_products <- mutate(all_products,
+                       Price_Weight = Price*Quantity)
+
+recent_price_table <- ddply(all_products,
+                            ~Product,
+                            summarise,
+                            Cost = sum(Price_Weight)/sum(Quantity))
+
+recent_price_table <- recent_price_table[order(recent_price_table$Cost),]
+
+colnames(USDAequiv)[2] <- "USDA_Product"
+
+recent_price_table2 <- merge(recent_price_table,
+                            USDAequiv,
+                            by = "Product",
+                            all.x = T)
+
+colnames(CurrentUSDAPrices)[2] <- "USDA_Product"
+
+recent_price_table2 <- merge(recent_price_table2,
+                            CurrentUSDAPrices,
+                            by = "USDA_Product",
+                            all.x = T)
+
+recent_price_table2 <- recent_price_table2[,-1]
+recent_price_table2 <- recent_price_table2[,-3]
+colnames(recent_price_table2)[3] <- "USDA_Price"
+recent_price_table2[recent_price_table2$Product == "50/50", 3] <- recent_price_table2[recent_price_table2$Product == "50/50", 3] + .07 
+recent_price_table2 <- mutate(recent_price_table2,
+                              Difference = round(Cost - USDA_Price,2))
+recent_price_table2 <- recent_price_table2[order(recent_price_table2$Cost),]
+```
+
+### Raw Product Costs
+```{r Incoming Product Costs Table, echo=F, message=F, warning=F}
+kable(recent_price_table2, 
+      align = 'l',
+      row.names = F)
+```
+
+```{r Incoming Product Trending, echo=F, message=F, warning=F}
+IncomingData <- mutate(PurchasePrices,
+                       DateProduct = paste(Date, Product))
+
+IncomingTrend <- ddply(IncomingData,
+                       ~DateProduct,
+                       summarise,
+                       Date = max(Date),
+                       Price = mean(Price))
+
+IncomingTrend <- mutate(IncomingTrend,
+                        Product = gsub("^.*? "," ",DateProduct))
+
+IncomingTrend <- subset(IncomingTrend,
+                        !(Product == ' reg pork' |
+                          Product == ' Bison' |
+                          Product == ' xl pork' |
+                          Product == ' GFN 85' |
+                          Product == ' Round 85' |
+                          Product == ' tri tip' |
+                          Product == ' Lauras Lean' |
+                          Product == ' Chicken'))
+
+ggplot(data = IncomingTrend)+
+  geom_line(aes(x = Date, 
+                y = Price, 
+                color = Product))+
+  geom_point(aes(x= Date, 
+                 y= Price, 
+                 color = Product))+
+  ggtitle("Cost Trends") +
+  scale_y_continuous(breaks = seq(0.25,
+                                  3,
+                                  .25))+
+  coord_cartesian(ylim = c(0.25,3.25))+
+  geom_hline(yintercept = c(1,2,3,4), color = "dark grey")
+```
+
+### Final Product Costs
+```{r Products Produced Costs, echo=F, message=F, warning=F}
+#Calculate cost for each produced product------------------------------------------
+colnames(BlendIngredients)[2] <- "Product"
+
+Costs_table <- merge(recent_price_table, 
+                     BlendIngredients, 
+                     by = "Product",
+                     all.x = T)
+
+Costs <- ddply(Costs_table,
+               ~End_Product,
+               summarise,
+               'Cost' = round(sum(Cost*Quantity_lbs)/sum(Quantity_lbs),2))
+
+#Enter cost adjustments------------------------------------------------------------
+seventythree_adjust <-   0.13
+eighty_adjust <-         0.10
+eightyfive_adjust <-     0.12
+ninetyone_adjust <-      0.09
+ninetythree_adjust <-    0.07
+ninetyfivebull_adjust <- 0
+ninetysix_adjust <-      0.05
+angus85_adjust <-        0
+angus93_adjust <-        0
+buffalo_adjust <-        0
+chicken_adjust <-        0
+lauras_adjust <-         0
+pork_adjust <-           0
+psaround_adjust <-       0
+
+Costs$Adjustment <- c(seventythree_adjust,
+                      eighty_adjust,
+                      eightyfive_adjust,
+                      ninetyone_adjust,
+                      ninetythree_adjust,
+                      ninetyfivebull_adjust,
+                      ninetysix_adjust,
+                      angus85_adjust,
+                      angus93_adjust,
+                      buffalo_adjust,
+                      chicken_adjust,
+                      lauras_adjust,
+                      pork_adjust,
+                      psaround_adjust,
+                      NA)
+
+Costs <- mutate(Costs,
+                Adjusted_Cost = round(Cost+Adjustment,2))
+
+Costs <- subset(Costs,
+                !is.na(Costs$End_Product))
+
+Costssql <- Costs
+Costssql$Date <- as.character(Sys.Date())
+```
+
+```{r Final Product Cost Table, echo=F, message=F, warning=F}
+kable(Costs)
+
+#Write to SQL Table
+FinalProductCosts <- Costssql
+
+cn <- odbcDriverConnect(connection = 
+                          "Driver={SQL Server Native Client 11.0};
+                        server={Justin\\SQLEXPRESS};
+                        database={Stone Meats};
+                        trusted_connection=yes;")
+
+#Uncomment only when using new data and date--------------------------------------
+#sqlSave(cn, FinalProductCosts,     
+ #       rownames = F,
+  #      colnames = F,
+   #     append = T)
+
+final_product_data <- sqlFetch(cn, 'FinalProductCosts',
+                      colnames = F,
+                      rows_at_time = 1000)
+
+odbcCloseAll()
+```
+
+```{r Final Product Cost Trending, echo=F, message=F, warning=F}
+ggplot(data = final_product_data,
+       aes(x = Date, 
+           y = Cost, 
+           color = End_Product,
+           group = End_Product))+
+  geom_line()+
+  geom_point()+
+  ggtitle("Cost Trends")+
+  scale_y_continuous(breaks = seq(1,
+                                  3.25,
+                                  .25))+
+  coord_cartesian(ylim = c(1,3.25))+
+  geom_hline(yintercept = c(1,2,3,4), color = "dark grey")
+```
+
+### Current USDA Prices
+
+```{r USDA Price Table, echo=F, message=F, warning=F}
+kable(USDAPricesTable,
+      caption = "USDA Prices",
+      align = 'l',
+      row.names = F)
+```
+
+```{r USDA Price Trending, echo=F, message=F, warning=F}
+USDAPricesTrend <- subset(USDAPrices,
+                          Price>0) %>%
+  mutate(USDAPricesTrend, Price = Price/100)
+
+ggplot(data = USDAPricesTrend)+
+  geom_line(aes(x = Date, y = Price, color = Product))+
+  geom_point(aes(x= Date, y= Price, color = Product))+
+  ggtitle("Price Trends")+
+  scale_y_continuous(breaks = seq(0.25,
+                                  3.25,
+                                  .25))+
+  coord_cartesian(ylim = c(0.25,3.25))+
+  geom_hline(yintercept = c(1,2,3,4), color = "dark grey")
+```
+
+## **Pricing**
+
+### Warehouse Pricing
+```{r Warehouse Pricing, include=F}
+#Pull data to calculate Prices-----------------------------------------------------
+colnames(Costs)[1] <- "Blend"
+
+Pricing <- merge(Costs,
+                 Margins,
+                 by = "Blend",
+                 all.y = T)
+
+#Warehouse Pricing-----------------------------------------------------------------
+Warehouse <- subset(Pricing,
+                    Pricing_Category == 'Warehouse')
+
+#Warehouse Margins
+Warehouse_margins <- subset(Warehouse,
+                    (!is.na(Warehouse$Margin)))
+
+Warehouse_margins <- mutate(Warehouse_margins,
+                    Price = round((Cost+Adjustment)*(1+Margin),2))
+
+#Warehouse Markups
+Warehouse_markups <- subset(Warehouse,
+                            !is.na(Warehouse$Markup))
+
+Warehouse_markups <- mutate(Warehouse_markups,
+                            Price = round(Cost+Adjustment+Markup,2))
+
+#Warehouse Flat Rate
+Warehouse_flatrate <- subset(Warehouse,
+                             !is.na(Warehouse$Flat_Rate))
+
+if (is.null(Warehouse$Flat_Rate)==F) {
+  Warehouse_flatrate <- mutate(Warehouse_flatrate,
+                               Price = round(Flat_Rate ,2))}
+
+#Warehouse - Combine and refine
+Warehouse_Pricing <- rbind(Warehouse_margins,
+                           Warehouse_markups,
+                           Warehouse_flatrate)
+
+Warehouse_Pricing_Final <- cbind.data.frame(Warehouse_Pricing$Product,
+                                      Warehouse_Pricing$Product_Code,
+                                      Warehouse_Pricing$Price,
+                                      Warehouse_Pricing$Cost)
+
+colnames(Warehouse_Pricing_Final) <- c("Product", "Product Code", "Price", "Cost")
+
+Warehouse_Pricing_Final <- mutate(Warehouse_Pricing_Final,
+                                  Margin = Price - Cost,
+                                  'Margin Percent' = round((Price - Cost)/Cost,2)*100)
+
+Warehouse_Pricing_Final <- Warehouse_Pricing_Final[order(Warehouse_Pricing_Final$Product),]
+```
+
+```{r Warehouse Price Table, echo=F, warning=F, message=F}
+kable(Warehouse_Pricing_Final,
+      row.names = F,
+      align = 'l')
+```
+
+### Distributor Pricing
+```{r Distributor Pricing Calculations, include=F}
+Distributor_Items <- subset(Warehouse_Pricing,
+                            !is.na(Warehouse_Pricing$Distributor_Markup))
+
+Distributor_Pricing <- mutate(Distributor_Items,
+                              Price = Price + Distributor_Markup)
+
+Distributor_Pricing_Final <- cbind.data.frame(Distributor_Pricing$Product,
+                                              Distributor_Pricing$Product_Code,
+                                              Distributor_Pricing$Price,
+                                              Distributor_Pricing$Cost)
+
+colnames(Distributor_Pricing_Final) <- c("Product", "Product Code", "Price", "Cost")
+
+Distributor_Pricing_Final <- mutate(Distributor_Pricing_Final,
+                                    Margin = Price - Cost,
+                                    'Margin Percent' = round((Price-Cost)/Cost,2)*100)
+
+Distributor_Pricing_Final <- Distributor_Pricing_Final[order(Distributor_Pricing_Final$Product),]
+```
+
+```{r Distributor Price Table, echo=F, warning=F, message=F}
+kable(Distributor_Pricing_Final,
+      row.names = F,
+      align = 'l')
+
+```
+
+### Store Pricing
+```{r Store Pricing Calculations, include=F}
+Store_Items <- subset(Warehouse_Pricing,
+                            !is.na(Warehouse_Pricing$Store_Markup))
+
+Store_Pricing <- mutate(Store_Items,
+                              Price = Price + Store_Markup)
+
+Store_Pricing_Final <- cbind.data.frame(Store_Pricing$Product,
+                                        Store_Pricing$Product_Code,
+                                        Store_Pricing$Price,
+                                        Store_Pricing$Cost)
+
+colnames(Store_Pricing_Final) <- c("Product", "Product Code", "Price", "Cost")
+
+Store_Pricing_Final <- mutate(Store_Pricing_Final,
+                              Margin = Price - Cost,
+                              'Margin Percent' = round((Price-Cost)/Cost,2)*100)
+
+Store_Pricing_Final <- Store_Pricing_Final[order(Store_Pricing_Final$Product),]
+```
+
+```{r Store Price Table, echo=F, warning=F, message=F}
+kable(Store_Pricing_Final,
+      row.names = F,
+      align = 'l')
+```
+
+### Restaurant Pricing
+```{r Restaurant Pricing Calculations, include=F}
+#Restaurant Pricing-----------------------------------------------------------------
+Restaurant <- subset(Pricing,
+                    Pricing_Category == 'Restaurant')
+
+#Restaurant Margins
+Restaurant_margins <- subset(Restaurant,
+                    (!is.na(Restaurant$Margin)))
+
+Restaurant_margins <- mutate(Restaurant_margins,
+                    Price = round((Cost+Adjustment)*(1+Margin),2))
+
+#Restaurant Markups
+Restaurant_markups <- subset(Restaurant,
+                            !is.na(Restaurant$Markup))
+
+Restaurant_markups <- mutate(Restaurant_markups,
+                            Price = round(Cost+Adjustment+Markup,2))
+
+#Restaurant Flat Rate
+Restaurant_flatrate <- subset(Restaurant,
+                             !is.na(Restaurant$Flat_Rate))
+
+if (is.null(Restaurant$Flat_Rate)==F) {
+  Restaurant_flatrate <- mutate(Restaurant_flatrate,
+                               Price = round(Flat_Rate ,2))}
+
+#Restaurant - Combine and refine
+Restaurant_Pricing <- rbind(Restaurant_margins,
+                           Restaurant_markups,
+                           Restaurant_flatrate)
+
+Restaurant_Pricing_Final <- cbind.data.frame(Restaurant_Pricing$Product,
+                                      Restaurant_Pricing$Product_Code,
+                                      Restaurant_Pricing$Price,
+                                      Restaurant_Pricing$Cost)
+
+colnames(Restaurant_Pricing_Final) <- c("Product", "Product Code", "Price", "Cost")
+
+Restaurant_Pricing_Final <- mutate(Restaurant_Pricing_Final,
+                                  Margin = Price - Cost,
+                                  'Margin Percent' = round((Price - Cost)/Cost,2)*100)
+
+Restaurant_Pricing_Final <- Restaurant_Pricing_Final[order(Restaurant_Pricing_Final$Product),]
+```
+
+```{r Restaurant Price Table, echo=F, warning=F, message=F}
+kable(Restaurant_Pricing_Final,
+      row.names = F,
+      align = 'l')
+```
+
+### Nicholas Pricing
+```{r Nicholas Pricing Calculations, include=F}
+#Nicholas Pricing-----------------------------------------------------------------
+Nicholas <- subset(Pricing,
+                    Pricing_Category == 'Nicholas')
+
+#Nicholas Margins
+Nicholas_margins <- subset(Nicholas,
+                    !is.na(Nicholas$Margin) & is.na(Nicholas$Markup))
+
+Nicholas_margins <- mutate(Nicholas_margins,
+                    Price = round((Cost+Adjustment)*(1+Margin),2))
+
+#Nicholas Markups
+Nicholas_markups <- subset(Nicholas,
+                            !is.na(Nicholas$Markup) & is.na(Nicholas$Margin))
+
+Nicholas_markups <- mutate(Nicholas_markups,
+                            Price = round(Cost+Adjustment+Markup,2))
+
+#Nicholas Markups & Margins
+
+Nicholas_markmarg <- subset(Nicholas,
+                            !is.na(Nicholas$Margin) & !is.na(Nicholas$Markup))
+
+Nicholas_markmarg <- mutate(Nicholas_markmarg,
+                            Price = round((Cost+Adjustment)*(1+Margin)+Markup,2))
+
+#Nicholas Flat Rate
+Nicholas_flatrate <- subset(Nicholas,
+                             !is.na(Nicholas$Flat_Rate))
+
+if (is.null(Nicholas$Flat_Rate)==F) {
+  Nicholas_flatrate <- mutate(Nicholas_flatrate,
+                               Price = round(Flat_Rate ,2))}
+
+#Nicholas - Combine and refine
+Nicholas_Pricing <- rbind(Nicholas_margins,
+                          Nicholas_markups,
+                          Nicholas_flatrate,
+                          Nicholas_markmarg)
+
+Nicholas_Pricing_Final <- cbind.data.frame(Nicholas_Pricing$Product,
+                                      Nicholas_Pricing$Product_Code,
+                                      Nicholas_Pricing$Price,
+                                      Nicholas_Pricing$Cost)
+
+colnames(Nicholas_Pricing_Final) <- c("Product", "Product Code", "Price", "Cost")
+
+Nicholas_Pricing_Final <- mutate(Nicholas_Pricing_Final,
+                                  Margin = Price - Cost,
+                                  'Margin Percent' = round((Price - Cost)/Cost,2)*100)
+
+Nicholas_Pricing_Final <- Nicholas_Pricing_Final[order(Nicholas_Pricing_Final$Product),]
+```
+
+```{r Nicholas Price Table, echo=F, warning=F, message=F}
+kable(Nicholas_Pricing_Final,
+      row.names = F,
+      align = 'l')
+```
+
+### Sysco SLC Pricing
+```{r Sysco SLC Pricing Calculations, include=F}
+#Sysco_SLC Pricing-----------------------------------------------------------------
+Sysco_SLC <- subset(Pricing,
+                    Pricing_Category == 'Sysco SLC')
+
+#Sysco_SLC Margins
+Sysco_SLC_margins <- subset(Sysco_SLC,
+                    !is.na(Sysco_SLC$Margin) & is.na(Sysco_SLC$Markup))
+
+Sysco_SLC_margins <- mutate(Sysco_SLC_margins,
+                    Price = round((Cost+Adjustment)*(1+Margin),2))
+
+#Sysco_SLC Markups
+Sysco_SLC_markups <- subset(Sysco_SLC,
+                            !is.na(Sysco_SLC$Markup) & is.na(Sysco_SLC$Margin))
+
+Sysco_SLC_markups <- mutate(Sysco_SLC_markups,
+                            Price = round(Cost+Adjustment+Markup,2))
+
+#Sysco_SLC Markups & Margins
+
+Sysco_SLC_markmarg <- subset(Sysco_SLC,
+                            !is.na(Sysco_SLC$Margin) & !is.na(Sysco_SLC$Markup))
+
+Sysco_SLC_markmarg <- mutate(Sysco_SLC_markmarg,
+                            Price = round((Cost+Adjustment)*(1+Margin)+Markup,2))
+
+#Sysco_SLC Flat Rate
+Sysco_SLC_flatrate <- subset(Sysco_SLC,
+                             !is.na(Sysco_SLC$Flat_Rate))
+
+if (is.null(Sysco_SLC$Flat_Rate)==F) {
+  Sysco_SLC_flatrate <- mutate(Sysco_SLC_flatrate,
+                               Price = round(Flat_Rate ,2))}
+
+#Sysco_SLC - Combine and refine
+Sysco_SLC_Pricing <- rbind(Sysco_SLC_margins,
+                          Sysco_SLC_markups,
+                          Sysco_SLC_flatrate,
+                          Sysco_SLC_markmarg)
+
+Sysco_SLC_Pricing_Final <- cbind.data.frame(Sysco_SLC_Pricing$Product,
+                                      Sysco_SLC_Pricing$Product_Code,
+                                      Sysco_SLC_Pricing$Price,
+                                      Sysco_SLC_Pricing$Cost)
+
+colnames(Sysco_SLC_Pricing_Final) <- c("Product", "Product Code", "Price", "Cost")
+
+Sysco_SLC_Pricing_Final <- mutate(Sysco_SLC_Pricing_Final,
+                                  Margin = Price - Cost,
+                                  'Margin Percent' = round((Price - Cost)/Cost,2)*100)
+
+Sysco_SLC_Pricing_Final <- Sysco_SLC_Pricing_Final[order(Sysco_SLC_Pricing_Final$Product),]
+```
+
+```{r Sysco_SLC Price Table, echo=F, warning=F, message=F}
+kable(Sysco_SLC_Pricing_Final,
+      row.names = F,
+      align = 'l')
+```
+
+```{r Write Pricing to Excel Files, include=F}
+Pricing_file <- 'C:\\users\\jnipko\\Documents\\Pricing\\Customer_Files\\Pricing.xlsx'
+Associated_file <- 'C:\\users\\jnipko\\Documents\\Pricing\\Customer_Files\\Associated.xlsx'
+Kroger_file <- 'C:\\users\\jnipko\\Documents\\Pricing\\Customer_Files\\kroger case ready price.xlsx'
+updated_Kroger_file <- 'C:\\users\\jnipko\\Documents\\Pricing\\Customer_Files\\Kroger Pricing.xlsx'
+
+#Warehouse
+write.xlsx(Warehouse_Pricing_Final, 
+           file = Pricing_file, 
+           sheetName="Warehouse", 
+           col.names=T,
+           row.names=F, 
+           append=F)
+
+#Distibutor
+write.xlsx(Distributor_Pricing_Final, 
+           file = Pricing_file, 
+           sheetName="Distributor", 
+           col.names=T,
+           row.names=F, 
+           append=T)
+
+#Store
+write.xlsx(Store_Pricing_Final, 
+           file = Pricing_file, 
+           sheetName="Store", 
+           col.names=T,
+           row.names=F, 
+           append=T)
+
+#Restaurant
+write.xlsx(Restaurant_Pricing_Final, 
+           file = Pricing_file, 
+           sheetName="Restaurant", 
+           col.names=T,
+           row.names=F, 
+           append=T)
+
+#Nicholas
+write.xlsx(Nicholas_Pricing_Final, 
+           file = Pricing_file, 
+           sheetName="Nicholas", 
+           col.names=T,
+           row.names=F, 
+           append=T)
+
+#Sysco SLC
+write.xlsx(Sysco_SLC_Pricing_Final, 
+           file = Pricing_file, 
+           sheetName="SyscoSLC", 
+           col.names=T,
+           row.names=F, 
+           append=T)
+
+#Associated
+Associated <- cbind.data.frame(Warehouse_Pricing_Final$Product,
+                    Warehouse_Pricing_Final$"Product Code",
+                    Warehouse_Pricing_Final$Price)
+
+colnames(Associated) <- c("Product", "Product Code", "Price")
+
+Associated <- mutate(Associated,
+                     Price = (ceiling(Price*100))/100)
+
+write.xlsx(Associated, 
+           file = Associated_file, 
+           sheetName= "Associated", 
+           col.names=T,
+           row.names=F, 
+           append=F)
+
+#Kroger
+Kroger <- cbind.data.frame(Costs$Blend,
+                           Costs$Adjusted_Cost)
+
+colnames(Kroger) <- c("Product", "Cost")
+
+wb <- loadWorkbook(Kroger_file)
+f <- getSheets(wb)[[2]]
+addDataFrame(Kroger, sheet = f, startRow = 1, startColumn = 1, row.names = F)
+wb$setForceFormulaRecalculation(T)
+saveWorkbook(wb, file = updated_Kroger_file)
+
+```
